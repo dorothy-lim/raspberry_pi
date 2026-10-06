@@ -65,3 +65,16 @@ while True:
 
 - 서버: 640x480 30.1fps, 프레임 약 37KB(약 9Mbit/s), 하드웨어 인코더, Pi CPU 약 13%, 클라이언트 2대 동시 접속에서도 중복·누락 0
 - 클라이언트(이 테스트 PC, CPU 전용, yolo11n): 약 18fps 처리, 프레임당 추론+그리기 50~80ms
+
+## USB 카메라 (port 8001)
+
+Pi에 연결된 USB 웹캠(Philips SPC 1300NC)은 `usb_camera_stream.py`가 **8001번 포트**로 스트리밍합니다.
+엔드포인트/헤더가 같으므로 클라이언트는 URL만 바꾸면 됩니다.
+
+```bash
+python object_tracker.py --url http://192.168.0.82:8001/video_feed
+python mjpeg_reader.py http://192.168.0.82:8001/video_feed
+```
+
+- 카메라가 거꾸로 설치되어 있어 `ROTATE=180`(기본)으로 회전 후 재인코딩 — 29.3fps, 약 50KB/프레임, Pi CPU 약 40%
+- `ROTATE=0`이면 카메라 MJPEG를 그대로 전달 — 29.3fps, 약 106KB/프레임(약 25Mbit/s), Pi CPU 약 15%

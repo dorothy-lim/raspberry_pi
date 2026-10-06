@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/python3 /home/pi/pyProject/pi_camera/usb_camera_stream.py
 WorkingDirectory=/home/pi/pyProject/pi_camera
-Environment=ROTATE=180
+Environment=ROTATE=0
 Environment=PORT=8001
 Environment=PYTHONUNBUFFERED=1
 Restart=always

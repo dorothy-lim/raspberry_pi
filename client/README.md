@@ -76,5 +76,5 @@ python object_tracker.py --url http://192.168.0.82:8001/video_feed
 python mjpeg_reader.py http://192.168.0.82:8001/video_feed
 ```
 
-- 카메라가 거꾸로 설치되어 있어 `ROTATE=180`(기본)으로 회전 후 재인코딩 — 29.3fps, 약 50KB/프레임, Pi CPU 약 40%
-- `ROTATE=0`이면 카메라 MJPEG를 그대로 전달 — 29.3fps, 약 106KB/프레임(약 25Mbit/s), Pi CPU 약 15%
+- `ROTATE=180`이면 회전 후 재인코딩 (카메라가 거꾸로 설치된 경우) — 29.3fps, 약 50KB/프레임, Pi CPU 약 40%
+- `ROTATE=0`(기본)이면 카메라 MJPEG를 그대로 전달 — 29.3fps, 약 106KB/프레임(약 25Mbit/s), Pi CPU 약 15%

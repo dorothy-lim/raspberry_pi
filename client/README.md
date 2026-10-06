@@ -71,9 +71,12 @@ while True:
 Pi에 연결된 USB 웹캠(Philips SPC 1300NC)은 `usb_camera_stream.py`가 **8001번 포트**로 스트리밍합니다.
 엔드포인트/헤더가 같으므로 클라이언트는 URL만 바꾸면 됩니다.
 
+카메라가 거꾸로 설치되어 있으므로 PC에서 `--rotate 180`으로 바로 세웁니다 (Pi는 원본을 그대로 전달 → Pi CPU 절약).
+뒤집힌 영상은 YOLO가 거의 인식하지 못하므로 꼭 지정하세요.
+
 ```bash
-python object_tracker.py --url http://192.168.0.82:8001/video_feed
-python mjpeg_reader.py http://192.168.0.82:8001/video_feed
+python object_tracker.py --url http://192.168.0.82:8001/video_feed --rotate 180
+python mjpeg_reader.py http://192.168.0.82:8001/video_feed 180
 ```
 
 - `ROTATE=180`이면 회전 후 재인코딩 (카메라가 거꾸로 설치된 경우) — 29.3fps, 약 50KB/프레임, Pi CPU 약 40%

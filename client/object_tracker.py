@@ -5,6 +5,7 @@
     python object_tracker.py --classes person car --conf 0.5
     python object_tracker.py --model yolo11s.pt --device cuda:0 --save out.mp4
     python object_tracker.py --no-show --log tracks.csv       # 화면 없이 CSV 기록
+    python object_tracker.py --url http://192.168.0.82:8001/video_feed --rotate 180   # USB 카메라(거꾸로 설치)
 
 화면 키: q / ESC 종료
 """
@@ -31,6 +32,8 @@ def color_for(track_id):
 def parse_args():
     p = argparse.ArgumentParser(description="Pi camera object detection & tracking")
     p.add_argument("--url", default="http://192.168.0.82:8000/video_feed")
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help="받은 영상을 시계 방향으로 회전 (거꾸로 달린 카메라는 180)")
     p.add_argument("--model", default="yolo11n.pt", help="YOLO 모델 (처음 실행 시 자동 다운로드)")
     p.add_argument("--tracker", default="bytetrack.yaml", help="bytetrack.yaml 또는 botsort.yaml")
     p.add_argument("--conf", type=float, default=0.4)
@@ -65,7 +68,7 @@ def main():
     model = YOLO(args.model)
     class_ids = resolve_classes(model, args.classes)
 
-    reader = MJPEGStreamReader(args.url).start()
+    reader = MJPEGStreamReader(args.url, rotate=args.rotate).start()
     print(f"[tracker] connecting {args.url} ...")
 
     trails = defaultdict(lambda: deque(maxlen=TRAIL_LEN))   # id -> [(t, cx, cy)]

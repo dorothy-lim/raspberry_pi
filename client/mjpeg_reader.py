@@ -7,6 +7,7 @@ cv2.VideoCapture(url)은 내부 버퍼 때문에 처리 속도가 느리면 지�
 
 사용 예:
     reader = MJPEGStreamReader("http://192.168.0.82:8000/video_feed").start()
+    reader = MJPEGStreamReader("http://192.168.0.82:8001/video_feed", rotate=180).start()  # 거꾸로 달린 카메라
     frame = reader.read()          # 새 프레임 (numpy BGR) — frame.image, frame.frame_id, frame.timestamp
     reader.stop()
 """
@@ -18,6 +19,8 @@ import cv2
 import numpy as np
 import requests
 
+ROTATE_CODES = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
 
 @dataclass
 class Frame:
@@ -28,8 +31,12 @@ class Frame:
 
 
 class MJPEGStreamReader:
-    def __init__(self, url, timeout=5.0, reconnect_delay=1.0):
+    def __init__(self, url, timeout=5.0, reconnect_delay=1.0, rotate=0):
+        """rotate: 0/90/180/270 — 받은 프레임을 시계 방향으로 회전 (PC에서 처리, Pi 부하 없음)."""
+        if rotate not in (0, *ROTATE_CODES):
+            raise ValueError("rotate must be 0, 90, 180 or 270")
         self.url = url
+        self.rotate = rotate
         self.timeout = timeout
         self.reconnect_delay = reconnect_delay
         self._latest = None
@@ -99,6 +106,8 @@ class MJPEGStreamReader:
             img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 continue
+            if self.rotate:
+                img = cv2.rotate(img, ROTATE_CODES[self.rotate])
             now = time.time()
             frame = Frame(
                 image=img,
@@ -115,12 +124,13 @@ class MJPEGStreamReader:
 
 if __name__ == "__main__":
     # 단독 실행: 스트림 확인용 뷰어 (q / ESC 종료)
-    #   python mjpeg_reader.py [URL]
+    #   python mjpeg_reader.py [URL] [회전 0|90|180|270]
     import sys
 
     url = sys.argv[1] if len(sys.argv) > 1 else "http://192.168.0.82:8000/video_feed"
-    max_frames = int(sys.argv[2]) if len(sys.argv) > 2 else 0   # 0이면 무제한
-    reader = MJPEGStreamReader(url).start()
+    rotate = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    max_frames = int(sys.argv[3]) if len(sys.argv) > 3 else 0   # 0이면 무제한 (테스트용)
+    reader = MJPEGStreamReader(url, rotate=rotate).start()
     print(f"[viewer] {url}  (q / ESC: 종료)")
     last, n, t0 = None, 0, time.time()
     try:

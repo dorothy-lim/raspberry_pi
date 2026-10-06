@@ -62,9 +62,9 @@ CCM_INDOOR = [
 
 # -------------------------------------------------
 # HTTPS(자체 서명 인증서) 설정
-# USE_HTTPS=0 환경변수로 HTTP 모드 실행 가능
+# 기본은 HTTP. USE_HTTPS=1 환경변수로 HTTPS(자체 서명 인증서) 실행 가능
 # -------------------------------------------------
-USE_HTTPS = os.getenv("USE_HTTPS", "1") != "0"
+USE_HTTPS = os.getenv("USE_HTTPS", "0") == "1"
 SSL_CERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
 SSL_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
 

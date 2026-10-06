@@ -111,3 +111,40 @@ class MJPEGStreamReader:
                 self._latest = frame
                 self.frames_received += 1
                 self._cond.notify_all()
+
+
+if __name__ == "__main__":
+    # 단독 실행: 스트림 확인용 뷰어 (q / ESC 종료)
+    #   python mjpeg_reader.py [URL]
+    import sys
+
+    url = sys.argv[1] if len(sys.argv) > 1 else "http://192.168.0.82:8000/video_feed"
+    max_frames = int(sys.argv[2]) if len(sys.argv) > 2 else 0   # 0이면 무제한
+    reader = MJPEGStreamReader(url).start()
+    print(f"[viewer] {url}  (q / ESC: 종료)")
+    last, n, t0 = None, 0, time.time()
+    try:
+        while True:
+            f = reader.read(timeout=3.0, last_id=last)
+            if f is None:
+                print("[viewer] waiting for frames ...")
+                continue
+            last = f.frame_id
+            n += 1
+            fps = n / max(1e-6, time.time() - t0)
+            cv2.putText(f.image, f"#{f.frame_id}  {fps:.1f} fps", (8, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            if n == 1:
+                print(f"[viewer] first frame {f.image.shape[1]}x{f.image.shape[0]}")
+            if n % 30 == 0:
+                print(f"[viewer] frame #{f.frame_id}, {fps:.1f} fps")
+            cv2.imshow("Pi camera", f.image)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+            if max_frames and n >= max_frames:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        reader.stop()
+        cv2.destroyAllWindows()

@@ -5,6 +5,7 @@ import signal
 import sys
 import os
 import ssl
+import socket
 import subprocess
 from collections import deque
 from flask import Flask, Response, request
@@ -61,7 +62,9 @@ CCM_INDOOR = [
 
 # -------------------------------------------------
 # HTTPS(자체 서명 인증서) 설정
+# USE_HTTPS=0 환경변수로 HTTP 모드 실행 가능
 # -------------------------------------------------
+USE_HTTPS = os.getenv("USE_HTTPS", "1") != "0"
 SSL_CERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
 SSL_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
 
@@ -96,20 +99,61 @@ def read_cpu_percent():
     except Exception:
         return -1.0
 
+def get_local_ips():
+    """이 장치의 IPv4 주소 목록 (hostname -I)."""
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5).stdout
+        return [ip for ip in out.split() if ip.count(".") == 3]
+    except Exception:
+        return []
+
+def build_san_entries():
+    """인증서 SAN 항목: localhost, 호스트명, 모든 로컬 IP."""
+    hostname = socket.gethostname()
+    dns = ["localhost", hostname, f"{hostname}.local"]
+    ips = ["127.0.0.1"] + get_local_ips()
+    return [f"DNS:{d}" for d in dict.fromkeys(dns)] + [f"IP:{i}" for i in dict.fromkeys(ips)]
+
+def cert_covers(cert_file, san_entries):
+    """기존 인증서의 SAN에 현재 필요한 항목이 모두 들어 있는지 확인."""
+    try:
+        out = subprocess.run(
+            ["openssl", "x509", "-in", cert_file, "-noout", "-ext", "subjectAltName"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return False
+    # openssl 출력 형식: "DNS:localhost, IP Address:192.168.0.82"
+    lines = out.replace("IP Address:", "IP:").splitlines()
+    present = {e.strip() for line in lines[1:] for e in line.split(",")}
+    return set(san_entries) <= present
+
 def ensure_self_signed_cert(cert_file=SSL_CERT_FILE, key_file=SSL_KEY_FILE):
-    """HTTPS용 자체 서명 인증서가 없으면 openssl로 생성한다."""
-    if os.path.isfile(cert_file) and os.path.isfile(key_file):
+    """HTTPS용 자체 서명 인증서 준비.
+
+    SAN(subjectAltName)이 없는 인증서는 Chrome/Edge가 거부하고 '이동' 링크도 막으므로,
+    인증서가 없거나 SAN에 현재 IP/호스트명이 빠져 있으면 다시 생성한다.
+    """
+    san_entries = build_san_entries()
+    if (os.path.isfile(cert_file) and os.path.isfile(key_file)
+            and cert_covers(cert_file, san_entries)):
         return
     print(f"[SSL] Generating self-signed certificate: {cert_file}, {key_file}")
+    print(f"[SSL] SAN = {', '.join(san_entries)}")
     subprocess.run(
         [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256",
             "-keyout", key_file, "-out", cert_file,
-            "-days", "3650", "-nodes",
-            "-subj", "/CN=picamera2-stream",
+            "-days", "825", "-nodes",
+            "-subj", f"/CN={socket.gethostname()}",
+            "-addext", "subjectAltName=" + ",".join(san_entries),
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
         ],
         check=True,
     )
+    os.chmod(key_file, 0o600)
 
 # -------------------------------------------------
 # MJPEG Output
@@ -349,12 +393,14 @@ if __name__ == "__main__":
     with state_lock:
         restart_camera(RES_LEVELS[current_res_idx], current_q, current_fps)
 
-    ensure_self_signed_cert()
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(certfile=SSL_CERT_FILE, keyfile=SSL_KEY_FILE)
+    ssl_context = None
+    if USE_HTTPS:
+        ensure_self_signed_cert()
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=SSL_CERT_FILE, keyfile=SSL_KEY_FILE)
 
     # systemd: 준비 완료 + 상태 메시지
-    sd_notify("READY=1\nSTATUS=Running (HTTPS)")
+    sd_notify(f"READY=1\nSTATUS=Running ({'HTTPS' if USE_HTTPS else 'HTTP'})")
 
     threading.Thread(target=tuning_thread, daemon=True).start()
     threading.Thread(target=systemd_watchdog_thread, daemon=True).start()

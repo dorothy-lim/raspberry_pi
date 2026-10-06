@@ -1,0 +1,6 @@
+__pycache__/
+*.pt
+*.mp4
+*.csv
+cert.pem
+key.pem

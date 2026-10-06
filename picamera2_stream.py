@@ -1,4 +1,20 @@
 # -*- coding: utf-8 -*-
+"""Pi Camera MJPEG 스트리밍 서버 (물체 인식/추적 클라이언트용).
+
+- 고정 해상도/FPS (기본 640x480 @ 30fps) — 자동 튜닝 없음, 카메라 재시작 없음
+- 하드웨어 MJPEG 인코더(bcm2835-codec) 우선, 실패 시 소프트웨어 JpegEncoder로 대체
+- 각 프레임에 X-Frame-Id / X-Timestamp 헤더 포함, 같은 프레임 중복 전송 안 함
+
+엔드포인트
+  /video_feed    multipart MJPEG 스트림
+  /snapshot.jpg  최신 프레임 1장
+  /status        JSON 상태 (해상도, 실제 fps, 인코더, 온도 등)
+
+환경변수 (systemd: Environment=STREAM_FPS=20 등)
+  STREAM_WIDTH=640  STREAM_HEIGHT=480  STREAM_FPS=30
+  ENCODER=hw|sw     MJPEG_BITRATE=10000000 (hw)   JPEG_QUALITY=80 (sw)
+  USE_HTTPS=0|1     PORT=8000
+"""
 import threading
 import time
 import signal
@@ -8,11 +24,30 @@ import ssl
 import socket
 import subprocess
 from collections import deque
-from flask import Flask, Response, request
+from flask import Flask, Response, request, jsonify
 
 from picamera2 import Picamera2
-from picamera2.encoders import JpegEncoder
+from picamera2.encoders import JpegEncoder, MJPEGEncoder
 from picamera2.outputs import Output
+
+# -------------------------------------------------
+# 설정
+# -------------------------------------------------
+WIDTH = int(os.getenv("STREAM_WIDTH", "640"))
+HEIGHT = int(os.getenv("STREAM_HEIGHT", "480"))
+FPS = int(os.getenv("STREAM_FPS", "30"))
+ENCODER = os.getenv("ENCODER", "hw").lower()
+MJPEG_BITRATE = int(os.getenv("MJPEG_BITRATE", "10000000"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
+PORT = int(os.getenv("PORT", "8000"))
+
+# 기본은 HTTP. USE_HTTPS=1 환경변수로 HTTPS(자체 서명 인증서) 실행 가능
+USE_HTTPS = os.getenv("USE_HTTPS", "0") == "1"
+SSL_CERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
+SSL_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
+
+# 프레임이 이 시간 이상 안 들어오면 watchdog 알림을 멈춰 systemd가 재시작하게 함
+FRAME_STALL_SEC = 5.0
 
 # -------------------------------------------------
 # 종료 제어
@@ -28,51 +63,7 @@ try:
 except Exception:
     SYSTEMD_OK = False
 
-# -------------------------------------------------
-# psutil (선택)
-# -------------------------------------------------
-try:
-    import psutil
-    PSUTIL_OK = True
-except Exception:
-    psutil = None
-    PSUTIL_OK = False
-
 app = Flask(__name__)
-
-# -------------------------------------------------
-# 튜닝 파라미터
-# -------------------------------------------------
-RES_LEVELS = [(320, 240), (640, 480), (1280, 720)]
-Q_MIN, Q_MAX = 55, 85
-FPS_MIN, FPS_MAX = 6, 20
-
-TEMP_HOT, TEMP_COOL = 70.0, 60.0
-CPU_HOT, CPU_COOL = 75.0, 45.0
-CPU_WINDOW = 5
-
-TARGET_FRAME_BYTES = 80_000
-TUNE_INTERVAL_SEC = 3.0
-
-CCM_INDOOR = [
-    1.30, -0.15, -0.15,
-   -0.10,  1.20, -0.10,
-   -0.05, -0.20,  1.25
-]
-
-# -------------------------------------------------
-# HTTPS(자체 서명 인증서) 설정
-# 기본은 HTTP. USE_HTTPS=1 환경변수로 HTTPS(자체 서명 인증서) 실행 가능
-# -------------------------------------------------
-USE_HTTPS = os.getenv("USE_HTTPS", "0") == "1"
-SSL_CERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
-SSL_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
-
-# 초기 상태
-state_lock = threading.Lock()
-current_res_idx = 1
-current_q = 80
-current_fps = 15
 
 # -------------------------------------------------
 # 유틸
@@ -88,14 +79,6 @@ def read_cpu_temp_c():
     try:
         with open("/sys/class/thermal/thermal_zone0/temp") as f:
             return float(f.read()) / 1000.0
-    except Exception:
-        return -1.0
-
-def read_cpu_percent():
-    if not PSUTIL_OK:
-        return -1.0
-    try:
-        return float(psutil.cpu_percent(interval=0.2))
     except Exception:
         return -1.0
 
@@ -162,62 +145,72 @@ class MJPEGOutput(Output):
     def __init__(self):
         super().__init__()
         self.frame = None
+        self.frame_id = 0          # 프레임 번호 (1부터 증가, 빠진 프레임 확인용)
+        self.frame_time = time.time()  # 프레임 수신 시각 (Pi 기준 Unix time), 시작 시각으로 초기화해 watchdog 유예
         self.condition = threading.Condition()
-        self.last_sizes = deque(maxlen=30)
+        self.recent = deque(maxlen=60)   # (time, size) — 실제 fps/크기 계산용
 
     def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=None):
         if stop_event.is_set():
             return
+        now = time.time()
         with self.condition:
-            self.frame = frame
-            self.last_sizes.append(len(frame))
+            self.frame = bytes(frame)
+            self.frame_id += 1
+            self.frame_time = now
+            self.recent.append((now, len(frame)))
             self.condition.notify_all()
 
-    def avg_frame_size(self):
+    def stats(self):
         with self.condition:
-            return sum(self.last_sizes) // len(self.last_sizes) if self.last_sizes else 0
+            r = list(self.recent)
+            fid, ft = self.frame_id, self.frame_time
+        fps = (len(r) - 1) / (r[-1][0] - r[0][0]) if len(r) > 1 and r[-1][0] > r[0][0] else 0.0
+        avg = sum(s for _, s in r) // len(r) if r else 0
+        return {"frame_id": fid, "last_frame_time": ft, "fps": round(fps, 2), "avg_frame_bytes": avg}
 
 # -------------------------------------------------
 # Camera
 # -------------------------------------------------
 picam2 = Picamera2()
 mjpeg_output = MJPEGOutput()
-encoder = None
+encoder_name = None
 
-def apply_fps_limit(fps):
-    frame_us = int(1_000_000 / max(1, fps))
-    picam2.set_controls({"FrameDurationLimits": (frame_us, frame_us)})
+def make_encoder(kind):
+    if kind == "hw":
+        return MJPEGEncoder(bitrate=MJPEG_BITRATE)
+    return JpegEncoder(q=JPEG_QUALITY)
 
-def restart_camera(resolution, q, fps):
-    """카메라 재시작(해상도/q/fps 반영). stop_event면 아무 것도 하지 않음."""
-    global encoder
-    if stop_event.is_set():
-        return
-
-    # recording 중이면 정지
-    try:
-        picam2.stop_recording()
-    except Exception:
-        pass
-
+def start_camera():
+    """고정 해상도/FPS로 카메라 시작. hw 인코더 실패 시 sw로 대체."""
+    global encoder_name
     config = picam2.create_video_configuration(
-        main={"size": resolution},
-        queue=False,        # 저지연
-        buffer_count=2
+        main={"size": (WIDTH, HEIGHT)},
+        buffer_count=4,
+        queue=False,        # 저지연: 항상 최신 프레임
     )
     picam2.configure(config)
-
+    frame_us = int(1_000_000 / max(1, FPS))
     picam2.set_controls({
         "AwbEnable": True,
         "AeEnable": True,
-        "ColourCorrectionMatrix": CCM_INDOOR
+        "FrameDurationLimits": (frame_us, frame_us),
     })
-    time.sleep(0.2)
 
-    apply_fps_limit(fps)
-
-    encoder = JpegEncoder(q=q)  # (현 구조에서 CPU 낮은 쪽 유지)
-    picam2.start_recording(encoder, mjpeg_output)
+    kinds = ["hw", "sw"] if ENCODER == "hw" else ["sw"]
+    for kind in kinds:
+        try:
+            picam2.start_recording(make_encoder(kind), mjpeg_output)
+            encoder_name = "MJPEGEncoder(hw)" if kind == "hw" else "JpegEncoder(sw)"
+            print(f"[CAM] {WIDTH}x{HEIGHT} @ {FPS}fps, encoder={encoder_name}", flush=True)
+            return
+        except Exception as e:
+            print(f"[CAM] encoder {kind} failed: {e}", flush=True)
+            try:
+                picam2.stop_recording()
+            except Exception:
+                pass
+    raise RuntimeError("No usable JPEG encoder")
 
 def stop_everything(reason="unknown"):
     """중복 종료 로직 통합."""
@@ -226,6 +219,8 @@ def stop_everything(reason="unknown"):
 
     stop_event.set()
     sd_notify(f"STOPPING=1\nSTATUS=Stopping ({reason})")
+    with mjpeg_output.condition:
+        mjpeg_output.condition.notify_all()
 
     try:
         picam2.stop_recording()
@@ -235,71 +230,6 @@ def stop_everything(reason="unknown"):
         picam2.close()
     except Exception:
         pass
-
-# -------------------------------------------------
-# 자동 튜닝 스레드
-# -------------------------------------------------
-def tuning_thread():
-    global current_res_idx, current_q, current_fps
-    cpu_hist = deque(maxlen=CPU_WINDOW)
-
-    while not stop_event.is_set():
-        time.sleep(TUNE_INTERVAL_SEC)
-
-        temp = read_cpu_temp_c()
-        cpu = read_cpu_percent()
-        if cpu >= 0:
-            cpu_hist.append(cpu)
-        cpu_avg = sum(cpu_hist) / len(cpu_hist) if cpu_hist else -1
-
-        avg_size = mjpeg_output.avg_frame_size()
-
-        with state_lock:
-            res_idx, q, fps = current_res_idx, current_q, current_fps
-
-        new_res, new_q, new_fps = res_idx, q, fps
-        need_restart = False
-
-        overload = (
-            (temp >= 0 and temp >= TEMP_HOT) or
-            (cpu_avg >= 0 and cpu_avg >= CPU_HOT) or
-            (avg_size > 0 and avg_size > TARGET_FRAME_BYTES * 1.2)
-        )
-
-        if overload:
-            if new_q > Q_MIN:
-                new_q -= 10
-            elif new_fps > FPS_MIN:
-                new_fps -= 3
-            elif new_res > 0:
-                new_res -= 1
-            need_restart = True
-        else:
-            cool = (
-                (temp < 0 or temp <= TEMP_COOL) and
-                (cpu_avg < 0 or cpu_avg <= CPU_COOL) and
-                (avg_size == 0 or avg_size < TARGET_FRAME_BYTES * 0.8)
-            )
-            if cool:
-                if new_fps < FPS_MAX:
-                    new_fps += 2
-                elif new_res < len(RES_LEVELS) - 1:
-                    new_res += 1
-                elif new_q < Q_MAX:
-                    new_q += 3
-                need_restart = True
-
-        if need_restart and not stop_event.is_set():
-            with state_lock:
-                current_res_idx = max(0, min(new_res, len(RES_LEVELS) - 1))
-                current_q = max(Q_MIN, min(new_q, Q_MAX))
-                current_fps = max(FPS_MIN, min(new_fps, FPS_MAX))
-                resolution = RES_LEVELS[current_res_idx]
-
-            print(f"[TUNE] temp={temp:.1f}C cpu={cpu_avg:.1f}% size={avg_size}B -> "
-                  f"res={resolution} q={current_q} fps={current_fps}")
-
-            restart_camera(resolution, current_q, current_fps)
 
 # -------------------------------------------------
 # systemd watchdog 스레드
@@ -313,28 +243,38 @@ def systemd_watchdog_thread():
         return
 
     interval = int(watchdog_usec) / 1_000_000 / 2
-    print(f"[WATCHDOG] enabled (interval={interval:.2f}s)")
-    sd_notify(f"STATUS=Watchdog enabled ({interval:.2f}s)")
+    print(f"[WATCHDOG] enabled (interval={interval:.2f}s)", flush=True)
 
     while not stop_event.is_set():
-        sd_notify("WATCHDOG=1")
+        st = mjpeg_output.stats()
+        # 카메라가 멈추면 watchdog 알림을 보내지 않음 → systemd가 서비스 재시작
+        if time.time() - st["last_frame_time"] < FRAME_STALL_SEC:
+            sd_notify(f"WATCHDOG=1\nSTATUS={WIDTH}x{HEIGHT} {st['fps']}fps {encoder_name}")
+        else:
+            print("[WATCHDOG] camera stalled, skipping watchdog ping", flush=True)
         time.sleep(interval)
 
 # -------------------------------------------------
 # Flask
 # -------------------------------------------------
 def generate_mjpeg():
+    last_id = 0
     while not stop_event.is_set():
         with mjpeg_output.condition:
-            mjpeg_output.condition.wait(timeout=0.5)
+            # 새 프레임이 올 때만 전송 (같은 프레임 중복 전송 방지)
+            mjpeg_output.condition.wait_for(
+                lambda: mjpeg_output.frame_id != last_id or stop_event.is_set(), timeout=1.0)
+            if mjpeg_output.frame_id == last_id or mjpeg_output.frame is None:
+                continue
             frame = mjpeg_output.frame
-
-        if not frame:
-            continue
+            last_id = mjpeg_output.frame_id
+            ts = mjpeg_output.frame_time
 
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n"
-               b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+               b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+               b"X-Frame-Id: " + str(last_id).encode() + b"\r\n"
+               b"X-Timestamp: " + f"{ts:.6f}".encode() + b"\r\n\r\n" +
                frame + b"\r\n")
 
 @app.route("/video_feed")
@@ -342,8 +282,31 @@ def video_feed():
     return Response(
         generate_mjpeg(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"},
         direct_passthrough=True
     )
+
+@app.route("/snapshot.jpg")
+def snapshot():
+    with mjpeg_output.condition:
+        frame, fid, ts = mjpeg_output.frame, mjpeg_output.frame_id, mjpeg_output.frame_time
+    if frame is None:
+        return "No frame yet", 503
+    return Response(frame, mimetype="image/jpeg", headers={
+        "Cache-Control": "no-cache, no-store",
+        "X-Frame-Id": str(fid),
+        "X-Timestamp": f"{ts:.6f}",
+    })
+
+@app.route("/status")
+def status():
+    st = mjpeg_output.stats()
+    st.update({
+        "width": WIDTH, "height": HEIGHT, "target_fps": FPS,
+        "encoder": encoder_name, "cpu_temp_c": read_cpu_temp_c(),
+        "server_time": time.time(),
+    })
+    return jsonify(st)
 
 @app.route("/shutdown")
 def shutdown():
@@ -358,19 +321,25 @@ def shutdown():
 
 @app.route("/")
 def index():
-    return """
+    return f"""
     <html>
     <body>
         <h1>Pi Camera Live Stream</h1>
-        <img src="/video_feed" width="640" height="480">
+        <img src="/video_feed" width="{WIDTH}" height="{HEIGHT}">
+        <p id="st"></p>
         <p>Press Q to shutdown</p>
         <script>
-        document.addEventListener("keydown", e => {
-            if (e.key === "q" || e.key === "Q") {
+        setInterval(() => fetch("/status").then(r => r.json()).then(s => {{
+            document.getElementById("st").textContent =
+                `${{s.width}}x${{s.height}} ${{s.fps}} fps, ${{(s.avg_frame_bytes/1000).toFixed(1)}} KB/frame, ` +
+                `${{s.encoder}}, ${{s.cpu_temp_c.toFixed(1)}}°C`;
+        }}), 1000);
+        document.addEventListener("keydown", e => {{
+            if (e.key === "q" || e.key === "Q") {{
                 fetch("/shutdown?q=Q");
                 alert("Shutdown requested");
-            }
-        });
+            }}
+        }});
         </script>
     </body>
     </html>
@@ -390,8 +359,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 # Main
 # -------------------------------------------------
 if __name__ == "__main__":
-    with state_lock:
-        restart_camera(RES_LEVELS[current_res_idx], current_q, current_fps)
+    start_camera()
 
     ssl_context = None
     if USE_HTTPS:
@@ -400,9 +368,9 @@ if __name__ == "__main__":
         ssl_context.load_cert_chain(certfile=SSL_CERT_FILE, keyfile=SSL_KEY_FILE)
 
     # systemd: 준비 완료 + 상태 메시지
-    sd_notify(f"READY=1\nSTATUS=Running ({'HTTPS' if USE_HTTPS else 'HTTP'})")
+    sd_notify(f"READY=1\nSTATUS=Running ({'HTTPS' if USE_HTTPS else 'HTTP'}) "
+              f"{WIDTH}x{HEIGHT}@{FPS} {encoder_name}")
 
-    threading.Thread(target=tuning_thread, daemon=True).start()
     threading.Thread(target=systemd_watchdog_thread, daemon=True).start()
 
-    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True, ssl_context=ssl_context)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True, ssl_context=ssl_context)
